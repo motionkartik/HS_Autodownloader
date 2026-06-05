@@ -34,12 +34,61 @@ local pendingBatch = nil
 local pendingTimer = nil
 local isDownloading = false
 local monitoringPaused = false
+local audioOnlyMode = false
+local currentTask = nil
 
 local function notify(title, text)
     hs.notify.new({
         title = title,
         informativeText = text
     }):send()
+end
+
+local function notifyDetected(urls)
+    hs.notify.new(
+        function(n)
+            if n:activationType() == hs.notify.activationTypes.actionButtonClicked then
+                if pendingTimer then
+                    pendingTimer:stop()
+                    pendingTimer = nil
+                end
+                pendingBatch = nil
+                updateMenu()
+            end
+        end,
+        {
+            title = "Videos Detected",
+            informativeText = #urls .. " download(s) starting in " .. COUNTDOWN_SECONDS .. " seconds" .. (audioOnlyMode and " [MP3]" or ""),
+            actionButtonTitle = "Cancel",
+            hasActionButton = true,
+            alwaysPresent = true,
+        }
+    ):send()
+end
+
+local function notifyComplete(filePath, downloadAudioOnly)
+    local name = filePath:match("([^/]+)$") or (downloadAudioOnly and "Audio (MP3)" or "Video")
+    hs.notify.new(
+        function(n)
+            local t = n:activationType()
+            if t == hs.notify.activationTypes.actionButtonClicked then
+                hs.execute('open "' .. DOWNLOAD_DIR .. '"')
+            elseif t == hs.notify.activationTypes.contentsClicked
+                or t == hs.notify.activationTypes.additionalActionClicked then
+                if filePath then
+                    hs.execute('open "' .. filePath .. '"')
+                end
+            end
+        end,
+        {
+            title = "Download Complete",
+            informativeText = name,
+            actionButtonTitle = "Open Folder",
+            otherButtonTitle = "Open",
+            hasActionButton = true,
+            alwaysPresent = true,
+        }
+    ):send()
 end
 
 local function loadHistory()
@@ -138,46 +187,38 @@ local function updateMenu()
     })
 
     table.insert(menu, {
-        title = "Open Download Folder",
+        title = audioOnlyMode and "Audio" or "Video",
         fn = function()
-            hs.execute('open "' .. DOWNLOAD_DIR .. '"')
+            audioOnlyMode = not audioOnlyMode
+            updateMenu()
         end
     })
 
-    table.insert(menu, {
-        title = "Show Queue",
-        fn = function()
+    table.insert(menu, { title = "-" })
 
-            if #queue == 0 then
-                notify("Queue", "Queue is empty")
-                return
+    table.insert(menu, {
+        title = "Stop Download",
+        fn = function()
+            if currentTask then
+                currentTask:terminate()
+                currentTask = nil
             end
-
-            notify("Queue", #queue .. " item(s) waiting")
-        end
-    })
-
-    table.insert(menu, {
-        title = "Clear Queue",
-        fn = function()
             queue = {}
+            if pendingTimer then
+                pendingTimer:stop()
+                pendingTimer = nil
+            end
+            pendingBatch = nil
+            isDownloading = false
+            notify("Download Stopped", "Queue cleared")
             updateMenu()
         end
     })
 
     table.insert(menu, {
-        title = "Clear History",
+        title = "Open Download Folder",
         fn = function()
-
-            history = {}
-
-            local file = io.open(HISTORY_FILE, "w")
-
-            if file then
-                file:close()
-            end
-
-            notify("History", "History cleared")
+            hs.execute('open "' .. DOWNLOAD_DIR .. '"')
         end
     })
 
@@ -210,14 +251,39 @@ local function processQueue()
     end
 
     local url = table.remove(queue, 1)
+    local downloadAudioOnly = audioOnlyMode
 
     isDownloading = true
 
     updateMenu()
 
-    notify("Download Started", url)
+    notify("Download Started", (downloadAudioOnly and "[MP3] " or "[MP4] ") .. url)
 
-    local command = string.format([[
+    local command
+
+    if downloadAudioOnly then
+        command = string.format([[
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+%s \
+--js-runtimes node:%s \
+--ffmpeg-location /opt/homebrew/bin \
+-f "bestaudio/best" \
+--extract-audio \
+--audio-format mp3 \
+--audio-quality 0 \
+--restrict-filenames \
+--no-playlist \
+-o "%s/%%(title)s.%%(ext)s" \
+"%s"
+]],
+            YTDLP,
+            NODE,
+            DOWNLOAD_DIR,
+            url
+        )
+    else
+        command = string.format([[
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 %s \
@@ -231,18 +297,20 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 -o "%s/%%(title)s.%%(ext)s" \
 "%s"
 ]],
-        YTDLP,
-        NODE,
-        DOWNLOAD_DIR,
-        url
-    )
+            YTDLP,
+            NODE,
+            DOWNLOAD_DIR,
+            url
+        )
+    end
 
-    hs.task.new(
+    currentTask = hs.task.new(
         "/bin/bash",
         function(exitCode, stdout, stderr)
 
             print("================================")
             print("URL:", url)
+            print("Mode:", downloadAudioOnly and "Audio Only (MP3)" or "Video (MP4)")
             print("Exit:", exitCode)
 
             if stdout and stdout ~= "" then
@@ -255,19 +323,24 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
             print("================================")
 
+            currentTask = nil
             isDownloading = false
 
             if exitCode == 0 then
                 saveHistory(url)
 
-                local title =
-                    stdout:match("%[download%] Destination: ([^\n]+)")
-                    or "Video"
+                local filePath =
+                    stdout:match("%[ExtractAudio%] Destination: ([^\n]+)")
+                    or stdout:match("%[Merger%] Merging formats into \"([^\"]+)\"")
+                    or stdout:match("%[download%] Destination: ([^\n]+)")
 
-                notify(
-                    "Download Complete",
-                    title
-                )
+                if not filePath then
+                    filePath = DOWNLOAD_DIR .. "/" .. (downloadAudioOnly and "audio.mp3" or "video.mp4")
+                end
+
+                filePath = filePath:gsub("^%s+", ""):gsub("%s+$", "")
+
+                notifyComplete(filePath, downloadAudioOnly)
             else
                 notify(
                     "Download Failed",
@@ -325,10 +398,7 @@ local clipboardWatcher = hs.pasteboard.watcher.new(function()
 
     pendingBatch = urls
 
-    notify(
-        "Videos Detected",
-        #urls .. " download(s) starting in " .. COUNTDOWN_SECONDS .. " seconds"
-    )
+    notifyDetected(urls)
 
     updateMenu()
 
