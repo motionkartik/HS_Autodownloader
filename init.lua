@@ -1,67 +1,70 @@
--- ==========================================
--- Auto Video Downloader Pro
--- ==========================================
+-- Auto Video Downloader Pro by @motionkartik
 
-local DOWNLOAD_DIR = os.getenv("HOME") .. "/Downloads/AutoDownloads"
-local HISTORY_FILE = os.getenv("HOME") .. "/Library/Application Support/Hammerspoon/video_history.txt"
+-- Paths
+local HOME         = os.getenv("HOME")
+local DOWNLOAD_DIR = HOME .. "/Downloads/AutoDownloads"
+local HISTORY_FILE = HOME .. "/Library/Application Support/Hammerspoon/video_history.txt"
+local YTDLP        = "/opt/homebrew/bin/yt-dlp"
+local NODE         = "/opt/homebrew/bin/node"
+local FFMPEG_DIR   = "/opt/homebrew/bin"
 
-local YTDLP = "/opt/homebrew/bin/yt-dlp"
-local NODE = "/opt/homebrew/bin/node"
-
-local COUNTDOWN_SECONDS = 5
+--  Config
+local COUNTDOWN_SECONDS  = 5
+local MAX_HISTORY        = 500
+local DOWNLOAD_TIMEOUT   = 600   
+local MAX_CONCURRENT     = 2     
+local CONCURRENT_FRAGS   = 4     
 
 local ALLOWED_DOMAINS = {
-    "youtube.com",
-    "youtu.be",
+    "youtube.com", "youtu.be",
     "instagram.com",
-    "facebook.com",
-    "fb.watch",
-    "x.com",
-    "twitter.com",
+    "facebook.com", "fb.watch",
+    "x.com", "twitter.com",
     "tiktok.com",
     "vimeo.com",
-    "pinterest.com"
+    "pinterest.com",
 }
 
 os.execute('mkdir -p "' .. DOWNLOAD_DIR .. '"')
-os.execute('mkdir -p "' .. os.getenv("HOME") .. '/Library/Application Support/Hammerspoon"')
+os.execute('mkdir -p "' .. HOME .. '/Library/Application Support/Hammerspoon"')
 
-local menubar = hs.menubar.new()
-
-local queue = {}
-local history = {}
-local pendingBatch = nil
-local pendingTimer = nil
-local isDownloading = false
+--  State
+local menubar          = hs.menubar.new()
+local queue            = {}      
+local history          = {}
+local pendingBatch     = nil
+local pendingTimer     = nil
 local monitoringPaused = false
-local audioOnlyMode = false
-local currentTask = nil
+local audioOnlyMode    = false
 
+local activeSlots = {}
+local function activeCount()
+    local n = 0
+    for _, s in pairs(activeSlots) do if s then n = n + 1 end end
+    return n
+end
+
+--  Notifications 
 local function notify(title, text)
-    hs.notify.new({
-        title = title,
-        informativeText = text
-    }):send()
+    hs.notify.new({ title = title, informativeText = text }):send()
 end
 
 local function notifyDetected(urls)
+    local modeTag = audioOnlyMode and " [MP3]" or " [MP4]"
     hs.notify.new(
         function(n)
             if n:activationType() == hs.notify.activationTypes.actionButtonClicked then
-                if pendingTimer then
-                    pendingTimer:stop()
-                    pendingTimer = nil
-                end
+                if pendingTimer then pendingTimer:stop(); pendingTimer = nil end
                 pendingBatch = nil
                 updateMenu()
             end
         end,
         {
-            title = "Videos Detected",
-            informativeText = #urls .. " download(s) starting in " .. COUNTDOWN_SECONDS .. " seconds" .. (audioOnlyMode and " [MP3]" or ""),
+            title             = "Videos Detected",
+            informativeText   = #urls .. " download(s) queued" .. modeTag,
             actionButtonTitle = "Cancel",
-            hasActionButton = true,
-            alwaysPresent = true,
+            hasActionButton   = true,
+            alwaysPresent     = true,
         }
     ):send()
 end
@@ -75,102 +78,129 @@ local function notifyComplete(filePath, downloadAudioOnly)
                 hs.execute('open "' .. DOWNLOAD_DIR .. '"')
             elseif t == hs.notify.activationTypes.contentsClicked
                 or t == hs.notify.activationTypes.additionalActionClicked then
-                if filePath then
-                    hs.execute('open "' .. filePath .. '"')
-                end
+                if filePath then hs.execute('open "' .. filePath .. '"') end
             end
         end,
         {
-            title = "Download Complete",
-            informativeText = name,
+            title             = "Download Complete",
+            informativeText   = name,
             actionButtonTitle = "Open Folder",
-            otherButtonTitle = "Open",
-            hasActionButton = true,
-            alwaysPresent = true,
+            otherButtonTitle  = "Open",
+            hasActionButton   = true,
+            alwaysPresent     = true,
         }
     ):send()
 end
 
+--  History 
 local function loadHistory()
     local file = io.open(HISTORY_FILE, "r")
+    if not file then return end
 
-    if not file then
-        return
-    end
-
-    for line in file:lines() do
-        history[line] = true
-    end
-
+    local lines = {}
+    for line in file:lines() do table.insert(lines, line) end
     file:close()
+
+    local start = math.max(1, #lines - MAX_HISTORY + 1)
+    for i = start, #lines do history[lines[i]] = true end
+
+    if #lines > MAX_HISTORY then
+        local out = io.open(HISTORY_FILE, "w")
+        if out then
+            for i = start, #lines do out:write(lines[i] .. "\n") end
+            out:close()
+        end
+    end
 end
 
 local function saveHistory(url)
     local file = io.open(HISTORY_FILE, "a")
-
-    if file then
-        file:write(url .. "\n")
-        file:close()
-    end
-
+    if file then file:write(url .. "\n"); file:close() end
     history[url] = true
 end
 
+--  Cleanup 
 local function cleanupTempFiles()
-    os.execute('find "' .. DOWNLOAD_DIR .. '" \\( -name "*.part" -o -name "*.ytdl" \\) -mtime +1 -delete')
+    os.execute('find "' .. DOWNLOAD_DIR
+        .. '" \\( -name "*.part" -o -name "*.ytdl" \\) -mtime +1 -delete')
 end
 
-local function updateMenu()
+--  yt-dlp args builder 
+local function buildArgs(url, audioOnly)
+    local outTemplate = DOWNLOAD_DIR .. "/%(title)s.%(ext)s"
+    local args = {
+        "--js-runtimes",         "node:" .. NODE,
+        "--ffmpeg-location",     FFMPEG_DIR,
+        "--restrict-filenames",
+        "--no-playlist",
+        "--concurrent-fragments", tostring(CONCURRENT_FRAGS),
+        "--print",               "after_move:filepath",
+        "-o",                    outTemplate,
+    }
 
-    local count = #queue
-
-    if pendingBatch then
-        count = count + #pendingBatch
+    if audioOnly then
+        local extra = {
+            "-f", "bestaudio/best",
+            "--extract-audio",
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
+        }
+        for _, v in ipairs(extra) do table.insert(args, v) end
+    else
+        local extra = {
+            "-f", "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+            "--merge-output-format", "mp4",
+            "--postprocessor-args",
+                "ffmpeg:-c:v libx264 -crf 23 -preset fast -c:a copy",
+        }
+        for _, v in ipairs(extra) do table.insert(args, v) end
     end
 
-    if isDownloading then
-        count = count + 1
-    end
+    table.insert(args, url)
+    return args
+end
 
-    menubar:setTitle("⬇︎ " .. count)
+--  Domain allow-list 
+local function isAllowed(url)
+    local lower = url:lower()
+    for _, domain in ipairs(ALLOWED_DOMAINS) do
+        if lower:find(domain, 1, true) then return true end
+    end
+    return false
+end
+
+--  Menu ─
+function updateMenu()
+    local ac    = activeCount()
+    local total = #queue + (pendingBatch and #pendingBatch or 0) + ac
+
+    local title = ac > 0
+        and ("⬇︎ " .. total .. " [" .. ac .. "/" .. MAX_CONCURRENT .. "]")
+        or  ("⬇︎ " .. total)
+    menubar:setTitle(title)
 
     local menu = {}
 
     if pendingBatch then
-        table.insert(menu, {
-            title = "Pending Batch (" .. #pendingBatch .. ")"
-        })
+        table.insert(menu, { title = "Pending Batch (" .. #pendingBatch .. ")" })
 
         table.insert(menu, {
             title = "Start Now",
             fn = function()
-
-                if pendingTimer then
-                    pendingTimer:stop()
-                    pendingTimer = nil
-                end
-
+                if pendingTimer then pendingTimer:stop(); pendingTimer = nil end
                 for _, url in ipairs(pendingBatch) do
-                    table.insert(queue, url)
+                    table.insert(queue, { url = url, audioOnly = audioOnlyMode })
                 end
-
                 pendingBatch = nil
-
-                updateMenu()
+                processQueue()
             end
         })
 
         table.insert(menu, {
             title = "Cancel Pending Batch",
             fn = function()
-
-                if pendingTimer then
-                    pendingTimer:stop()
-                    pendingTimer = nil
-                end
-
+                if pendingTimer then pendingTimer:stop(); pendingTimer = nil end
                 pendingBatch = nil
-
                 updateMenu()
             end
         })
@@ -187,7 +217,7 @@ local function updateMenu()
     })
 
     table.insert(menu, {
-        title = audioOnlyMode and "Audio" or "Video",
+        title = audioOnlyMode and "✓ Audio Only (MP3)" or "Video (MP4)",
         fn = function()
             audioOnlyMode = not audioOnlyMode
             updateMenu()
@@ -197,239 +227,150 @@ local function updateMenu()
     table.insert(menu, { title = "-" })
 
     table.insert(menu, {
-        title = "Stop Download",
+        title = "Stop All Downloads",
         fn = function()
-            if currentTask then
-                currentTask:terminate()
-                currentTask = nil
+            for slotId, slot in pairs(activeSlots) do
+                if slot then
+                    if slot.watchdog then slot.watchdog:stop() end
+                    if slot.task    then slot.task:terminate() end
+                    activeSlots[slotId] = nil
+                end
             end
             queue = {}
-            if pendingTimer then
-                pendingTimer:stop()
-                pendingTimer = nil
-            end
+            if pendingTimer then pendingTimer:stop(); pendingTimer = nil end
             pendingBatch = nil
-            isDownloading = false
-            notify("Download Stopped", "Queue cleared")
+            notify("Downloads Stopped", "All slots cleared")
             updateMenu()
         end
     })
 
     table.insert(menu, {
         title = "Open Download Folder",
-        fn = function()
-            hs.execute('open "' .. DOWNLOAD_DIR .. '"')
-        end
+        fn = function() hs.execute('open "' .. DOWNLOAD_DIR .. '"') end
     })
 
     menubar:setMenu(menu)
-
 end
 
-local function isAllowed(url)
-
-    local lower = url:lower()
-
-    for _, domain in ipairs(ALLOWED_DOMAINS) do
-        if lower:find(domain, 1, true) then
-            return true
-        end
-    end
-
-    return false
-end
-
-local function processQueue()
-
-    if isDownloading then
-        return
-    end
-
-    if #queue == 0 then
-        updateMenu()
-        return
-    end
-
-    local url = table.remove(queue, 1)
-    local downloadAudioOnly = audioOnlyMode
-
-    isDownloading = true
-
+--  Parallel download engine 
+function processQueue()
     updateMenu()
 
-    notify("Download Started", (downloadAudioOnly and "[MP3] " or "[MP4] ") .. url)
+    while activeCount() < MAX_CONCURRENT and #queue > 0 do
+        local item           = table.remove(queue, 1)
+        local url            = item.url
+        local downloadAudioOnly = item.audioOnly
 
-    local command
+        local slotId = url
 
-    if downloadAudioOnly then
-        command = string.format([[
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        notify("Download Started",
+            (downloadAudioOnly and "[MP3] " or "[MP4] ") .. url)
 
-%s \
---js-runtimes node:%s \
---ffmpeg-location /opt/homebrew/bin \
--f "bestaudio/best" \
---extract-audio \
---audio-format mp3 \
---audio-quality 0 \
---restrict-filenames \
---no-playlist \
--o "%s/%%(title)s.%%(ext)s" \
-"%s"
-]],
-            YTDLP,
-            NODE,
-            DOWNLOAD_DIR,
-            url
-        )
-    else
-        command = string.format([[
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        local args = buildArgs(url, downloadAudioOnly)
 
-%s \
---js-runtimes node:%s \
---ffmpeg-location /opt/homebrew/bin \
--f "bestvideo+bestaudio/best" \
---merge-output-format mp4 \
---recode-video mp4 \
---restrict-filenames \
---no-playlist \
--o "%s/%%(title)s.%%(ext)s" \
-"%s"
-]],
-            YTDLP,
-            NODE,
-            DOWNLOAD_DIR,
-            url
-        )
-    end
-
-    currentTask = hs.task.new(
-        "/bin/bash",
-        function(exitCode, stdout, stderr)
-
-            print("================================")
-            print("URL:", url)
-            print("Mode:", downloadAudioOnly and "Audio Only (MP3)" or "Video (MP4)")
-            print("Exit:", exitCode)
-
-            if stdout and stdout ~= "" then
-                print(stdout)
+        local watchdog = hs.timer.doAfter(DOWNLOAD_TIMEOUT, function()
+            local slot = activeSlots[slotId]
+            if slot and slot.task then
+                slot.task:terminate()
+                activeSlots[slotId] = nil
+                notify("Download Timed Out", url)
+                processQueue()
             end
+        end)
 
-            if stderr and stderr ~= "" then
-                print(stderr)
-            end
+        local task = hs.task.new(
+            YTDLP,
+            function(exitCode, stdout, stderr)
+                local slot = activeSlots[slotId]
+                if slot and slot.watchdog then slot.watchdog:stop() end
+                activeSlots[slotId] = nil
 
-            print("================================")
+                print("================================")
+                print("URL:",  url)
+                print("Mode:", downloadAudioOnly and "Audio Only (MP3)" or "Video (MP4)")
+                print("Exit:", exitCode)
+                if stdout and stdout ~= "" then print(stdout) end
+                if stderr and stderr ~= "" then print(stderr) end
+                print("================================")
 
-            currentTask = nil
-            isDownloading = false
+                if exitCode == 0 then
+                    saveHistory(url)
 
-            if exitCode == 0 then
-                saveHistory(url)
+                    local filePath = nil
+                    for line in (stdout or ""):gmatch("[^\n]+") do
+                        local trimmed = line:match("^%s*(.-)%s*$")
+                        if trimmed ~= "" then filePath = trimmed end
+                    end
+                    filePath = filePath
+                        or (DOWNLOAD_DIR .. "/" .. (downloadAudioOnly and "audio.mp3" or "video.mp4"))
 
-                local filePath =
-                    stdout:match("%[ExtractAudio%] Destination: ([^\n]+)")
-                    or stdout:match("%[Merger%] Merging formats into \"([^\"]+)\"")
-                    or stdout:match("%[download%] Destination: ([^\n]+)")
-
-                if not filePath then
-                    filePath = DOWNLOAD_DIR .. "/" .. (downloadAudioOnly and "audio.mp3" or "video.mp4")
+                    notifyComplete(filePath, downloadAudioOnly)
+                else
+                    notify("Download Failed", "Check Hammerspoon Console")
                 end
 
-                filePath = filePath:gsub("^%s+", ""):gsub("%s+$", "")
+                processQueue()
+            end,
+            args
+        ):start()
 
-                notifyComplete(filePath, downloadAudioOnly)
-            else
-                notify(
-                    "Download Failed",
-                    "Check Hammerspoon Console"
-                )
-            end
-
-            updateMenu()
-
-            processQueue()
-
-        end,
-        { "-c", command }
-    ):start()
+        activeSlots[slotId] = { task = task, watchdog = watchdog }
+        updateMenu()
+    end
 end
 
+--  Clipboard watcher 
 loadHistory()
 cleanupTempFiles()
+hs.timer.doEvery(86400, cleanupTempFiles)
 
 local clipboardWatcher = hs.pasteboard.watcher.new(function()
-
-    if monitoringPaused then
-        return
-    end
+    if monitoringPaused then return end
 
     local clipboard = hs.pasteboard.getContents()
-
-    if not clipboard then
-        return
-    end
+    if not clipboard or #clipboard < 10 then return end
 
     local urls = {}
-
     local seen = {}
 
     for url in clipboard:gmatch("https?://[%w%-%._~:/%?#%[%]@!$&%'%(%)%*%+,;=]+") do
+        url = url:gsub("[%.,%?!;]+$", "")
 
         if isAllowed(url)
             and not history[url]
             and not seen[url]
         then
-            seen[url] = true
-            table.insert(urls, url)
+            local alreadyQueued = false
+            for _, item in ipairs(queue) do
+                if item.url == url then alreadyQueued = true; break end
+            end
+            if not alreadyQueued and not activeSlots[url] then
+                seen[url] = true
+                table.insert(urls, url)
+            end
         end
-
     end
 
-    if #urls == 0 then
-        return
-    end
+    if #urls == 0 then return end
 
-    if pendingTimer then
-        pendingTimer:stop()
-    end
-
+    if pendingTimer then pendingTimer:stop() end
     pendingBatch = urls
-
     notifyDetected(urls)
-
     updateMenu()
 
-    pendingTimer = hs.timer.doAfter(
-        COUNTDOWN_SECONDS,
-        function()
+    pendingTimer = hs.timer.doAfter(COUNTDOWN_SECONDS, function()
+        if not pendingBatch then return end
 
-            if not pendingBatch then
-                return
-            end
-
-            for _, url in ipairs(pendingBatch) do
-                table.insert(queue, url)
-            end
-
-            pendingBatch = nil
-            pendingTimer = nil
-
-            updateMenu()
-            processQueue()
-
+        for _, url in ipairs(pendingBatch) do
+            table.insert(queue, { url = url, audioOnly = audioOnlyMode })
         end
-    )
+        pendingBatch = nil
+        pendingTimer = nil
 
+        processQueue()
+    end)
 end)
 
 clipboardWatcher:start()
-
 updateMenu()
-
-notify(
-    "Auto Downloader",
-    "Clipboard monitor started"
-)
+notify("Auto Downloader", "Clipboard monitor started")
