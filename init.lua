@@ -34,7 +34,7 @@ local queue            = {}
 local history          = {}
 local pendingBatch     = nil
 local pendingTimer     = nil
-local monitoringPaused = false
+local monitoringPaused = true
 local audioOnlyMode    = false
 
 local activeSlots = {}
@@ -209,7 +209,7 @@ function updateMenu()
     end
 
     table.insert(menu, {
-        title = monitoringPaused and "Resume Monitoring" or "Pause Monitoring",
+        title = monitoringPaused and "Not Monitoring" or "✓ Monitoring",
         fn = function()
             monitoringPaused = not monitoringPaused
             updateMenu()
@@ -217,7 +217,7 @@ function updateMenu()
     })
 
     table.insert(menu, {
-        title = audioOnlyMode and "✓ Audio Only (MP3)" or "Video (MP4)",
+        title = audioOnlyMode and "✓ Audio" or "✓ Video",
         fn = function()
             audioOnlyMode = not audioOnlyMode
             updateMenu()
